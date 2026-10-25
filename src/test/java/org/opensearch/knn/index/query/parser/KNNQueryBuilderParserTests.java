@@ -21,6 +21,7 @@ import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.index.util.KNNClusterUtil;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
+import org.opensearch.knn.index.query.QueryVectorSource;
 import org.opensearch.plugins.SearchPlugin;
 
 import java.io.IOException;
@@ -452,6 +453,70 @@ public class KNNQueryBuilderParserTests extends KNNTestCase {
         contentParserRescoreDisabled.nextToken();
         KNNQueryBuilder actualBuilderRescoreDisabled = KNNQueryBuilderParser.fromXContent(contentParserRescoreDisabled);
         assertEquals(knnQueryBuilderRescoreDisabled, actualBuilderRescoreDisabled);
+    }
+
+    public void testFromXContent_whenSource_thenSucceed() throws Exception {
+        QueryVectorSource source = new QueryVectorSource("products", "p1", "embedding", "graphrq_c0");
+        KNNQueryBuilder knnQueryBuilder = KNNQueryBuilder.builder().fieldName(FIELD_NAME).queryVectorSource(source).k(K).build();
+        XContentBuilder builder = XContentFactory.jsonBuilder();
+        builder.startObject();
+        builder.startObject(FIELD_NAME);
+        builder.field(KNNQueryBuilder.SOURCE_FIELD.getPreferredName(), source);
+        builder.field(KNNQueryBuilder.K_FIELD.getPreferredName(), K);
+        builder.endObject();
+        builder.endObject();
+        XContentParser contentParser = createParser(builder);
+        contentParser.nextToken();
+        KNNQueryBuilder actualBuilder = KNNQueryBuilderParser.fromXContent(contentParser);
+        assertEquals(knnQueryBuilder, actualBuilder);
+        assertNull(actualBuilder.vector());
+        assertEquals(source, actualBuilder.getQueryVectorSource());
+    }
+
+    public void testFromXContent_whenQueryDocumentAlias_thenSucceed() throws Exception {
+        XContentBuilder builder = XContentFactory.jsonBuilder();
+        builder.startObject();
+        builder.startObject(FIELD_NAME);
+        builder.startObject("query_document");
+        builder.field("id", "p1");
+        builder.field("field", "embedding");
+        builder.endObject();
+        builder.field(KNNQueryBuilder.K_FIELD.getPreferredName(), K);
+        builder.endObject();
+        builder.endObject();
+        XContentParser contentParser = createParser(builder);
+        contentParser.nextToken();
+        KNNQueryBuilder actualBuilder = KNNQueryBuilderParser.fromXContent(contentParser);
+        assertEquals("p1", actualBuilder.getQueryVectorSource().getId());
+        assertEquals("embedding", actualBuilder.getQueryVectorSource().getField());
+        assertNull(actualBuilder.vector());
+    }
+
+    public void testToXContent_whenSource_thenSucceed() throws IOException {
+        QueryVectorSource source = new QueryVectorSource("products", "p1", "embedding", "graphrq_c0");
+        KNNQueryBuilder knnQueryBuilder = KNNQueryBuilder.builder()
+            .fieldName(FIELD_NAME)
+            .queryVectorSource(source)
+            .k(K)
+            .boost(BOOST)
+            .build();
+
+        XContentBuilder expected = XContentFactory.jsonBuilder();
+        expected.startObject();
+        expected.startObject(NAME);
+        expected.startObject(FIELD_NAME);
+        expected.field(KNNQueryBuilder.SOURCE_FIELD.getPreferredName(), source);
+        expected.field(KNNQueryBuilder.K_FIELD.getPreferredName(), K);
+        expected.field(BOOST_FIELD.getPreferredName(), BOOST);
+        expected.endObject();
+        expected.endObject();
+        expected.endObject();
+
+        XContentBuilder testBuilder = XContentFactory.jsonBuilder();
+        testBuilder.startObject();
+        KNNQueryBuilderParser.toXContent(testBuilder, EMPTY_PARAMS, knnQueryBuilder);
+        testBuilder.endObject();
+        assertEquals(expected.toString(), testBuilder.toString());
     }
 
     public void testFromXContent_whenFlat_thenException() throws Exception {

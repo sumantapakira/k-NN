@@ -39,6 +39,15 @@ public class KNNQueryBuilderInvalidParamsTests extends KNNTestCase {
                     KNNQueryBuilder.builder().k(1).fieldName(FIELD_NAME).vector(new float[] {})
                 ),
                 $(
+                    "vector and source",
+                    "[knn] cannot set both vector and source",
+                    KNNQueryBuilder.builder()
+                        .k(1)
+                        .fieldName(FIELD_NAME)
+                        .vector(QUERY_VECTOR)
+                        .queryVectorSource(new QueryVectorSource(null, "doc-1", null, null))
+                ),
+                $(
                     "Neither knn nor radial search",
                     "[knn] requires exactly one of k, distance or score to be set",
                     KNNQueryBuilder.builder().fieldName(FIELD_NAME).vector(QUERY_VECTOR)

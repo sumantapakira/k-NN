@@ -20,6 +20,7 @@ import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.index.util.IndexUtil;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
+import org.opensearch.knn.index.query.QueryVectorSource;
 
 import java.io.IOException;
 import java.util.List;
@@ -48,6 +49,7 @@ import static org.opensearch.knn.index.query.KNNQueryBuilder.MAX_DISTANCE_FIELD;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.METHOD_PARAMS_FIELD;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.MIN_SCORE_FIELD;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.NAME;
+import static org.opensearch.knn.index.query.KNNQueryBuilder.SOURCE_FIELD;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.VECTOR_FIELD;
 
 /**
@@ -63,6 +65,10 @@ public final class KNNQueryBuilderParser {
      * version negotiated with the peer actually being written to.
      */
     private static final Version RADIAL_SIZE_MIN_VERSION = Version.V_3_9_0;
+    /**
+     * Minimum version that understands {@code source} (document-backed query vector).
+     */
+    private static final Version QUERY_VECTOR_SOURCE_MIN_VERSION = Version.V_3_10_0;
 
     /**
      * For a k-NN query, we need to parse roughly the following structure into a KNNQueryBuilder:
@@ -80,6 +86,7 @@ public final class KNNQueryBuilderParser {
         internalParser.declareFloat(KNNQueryBuilder.Builder::boost, BOOST_FIELD);
         internalParser.declareString(KNNQueryBuilder.Builder::queryName, NAME_FIELD);
         internalParser.declareFloatArray((b, v) -> b.vector(floatListToFloatArray(v)), VECTOR_FIELD);
+        internalParser.declareObject(KNNQueryBuilder.Builder::queryVectorSource, (p, v) -> QueryVectorSource.fromXContent(p), SOURCE_FIELD);
         internalParser.declareInt(KNNQueryBuilder.Builder::k, K_FIELD);
         internalParser.declareBoolean((b, v) -> {
             if (isClusterOnOrAfterMinRequiredVersion("ignore_unmapped")) {
@@ -132,7 +139,8 @@ public final class KNNQueryBuilderParser {
     public static KNNQueryBuilder.Builder streamInput(StreamInput in, Function<String, Boolean> minClusterVersionCheck) throws IOException {
         KNNQueryBuilder.Builder builder = new KNNQueryBuilder.Builder();
         builder.fieldName(in.readString());
-        builder.vector(in.readFloatArray());
+        final float[] vector = in.readFloatArray();
+        builder.vector(vector.length == 0 ? null : vector);
         if (minClusterVersionCheck.apply(KNNConstants.NULL_K)) {
             builder.k(in.readOptionalInt());
         } else {
@@ -165,6 +173,10 @@ public final class KNNQueryBuilderParser {
             builder.size(in.readOptionalVInt());
         }
 
+        if (in.getVersion().onOrAfter(QUERY_VECTOR_SOURCE_MIN_VERSION)) {
+            builder.queryVectorSource(in.readOptionalWriteable(QueryVectorSource::new));
+        }
+
         return builder;
     }
 
@@ -179,7 +191,15 @@ public final class KNNQueryBuilderParser {
     public static void streamOutput(StreamOutput out, KNNQueryBuilder builder, Function<String, Boolean> minClusterVersionCheck)
         throws IOException {
         out.writeString(builder.fieldName());
-        out.writeFloatArray((float[]) builder.vector());
+        final float[] vector = (float[]) builder.vector();
+        if (vector == null) {
+            if (out.getVersion().before(QUERY_VECTOR_SOURCE_MIN_VERSION)) {
+                throw new IllegalStateException("[knn] query vector source cannot be serialized to nodes before 3.10.0");
+            }
+            out.writeFloatArray(new float[0]);
+        } else {
+            out.writeFloatArray(vector);
+        }
         if (minClusterVersionCheck.apply(KNNConstants.NULL_K)) {
             out.writeOptionalInt(builder.getK());
         } else {
@@ -206,6 +226,9 @@ public final class KNNQueryBuilderParser {
         }
         if (out.getVersion().onOrAfter(RADIAL_SIZE_MIN_VERSION)) {
             out.writeOptionalVInt(builder.getSize());
+        }
+        if (out.getVersion().onOrAfter(QUERY_VECTOR_SOURCE_MIN_VERSION)) {
+            out.writeOptionalWriteable(builder.getQueryVectorSource());
         }
     }
 
@@ -255,7 +278,11 @@ public final class KNNQueryBuilderParser {
         builder.startObject(NAME);
         builder.startObject(knnQueryBuilder.fieldName());
 
-        builder.field(VECTOR_FIELD.getPreferredName(), knnQueryBuilder.vector());
+        if (knnQueryBuilder.vector() != null) {
+            builder.field(VECTOR_FIELD.getPreferredName(), knnQueryBuilder.vector());
+        } else if (knnQueryBuilder.getQueryVectorSource() != null) {
+            builder.field(SOURCE_FIELD.getPreferredName(), knnQueryBuilder.getQueryVectorSource());
+        }
 
         if (knnQueryBuilder.getK() != null) {
             builder.field(K_FIELD.getPreferredName(), knnQueryBuilder.getK());

@@ -13,21 +13,30 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
+import org.opensearch.action.get.GetRequest;
+import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.common.SetOnce;
 import org.opensearch.common.ValidationException;
+import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.ParseField;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.query.AbstractQueryBuilder;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilderVisitor;
+import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.WithFieldName;
+import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.transport.client.Client;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.VectorQueryType;
@@ -54,9 +63,11 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 import static org.opensearch.knn.common.KNNConstants.EXPAND_NESTED;
 import static org.opensearch.knn.common.KNNConstants.MAX_DISTANCE;
@@ -81,6 +92,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
     private static ModelDao modelDao;
 
     public static final ParseField VECTOR_FIELD = new ParseField("vector");
+    public static final ParseField SOURCE_FIELD = QueryVectorSource.NAME;
     public static final ParseField K_FIELD = new ParseField("k");
     public static final ParseField FILTER_FIELD = new ParseField("filter");
     public static final ParseField IGNORE_UNMAPPED_FIELD = new ParseField("ignore_unmapped");
@@ -130,6 +142,16 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
      */
     @Getter
     private Integer size;
+    /**
+     * Document that supplies the query vector (and optional routing term) instead of an inline float
+     * array. Resolved on the coordinating node by {@link #doRewrite(QueryRewriteContext)}.
+     */
+    @Getter
+    private QueryVectorSource queryVectorSource;
+    /**
+     * Filled by the async GET that resolves {@link #queryVectorSource}. Not serialized.
+     */
+    private Supplier<ResolvedQueryVector> sourceSupplier;
 
     /**
      * Constructs a new query with the given field name and vector
@@ -173,6 +195,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         private RescoreContext rescoreContext;
         private Boolean expandNested;
         private Integer size;
+        private QueryVectorSource queryVectorSource;
+        private Supplier<ResolvedQueryVector> sourceSupplier;
 
         public Builder() {}
 
@@ -183,6 +207,16 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
 
         public Builder vector(float[] vector) {
             this.vector = vector;
+            return this;
+        }
+
+        public Builder queryVectorSource(QueryVectorSource queryVectorSource) {
+            this.queryVectorSource = queryVectorSource;
+            return this;
+        }
+
+        Builder sourceSupplier(Supplier<ResolvedQueryVector> sourceSupplier) {
+            this.sourceSupplier = sourceSupplier;
             return this;
         }
 
@@ -255,7 +289,9 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 ignoreUnmapped,
                 rescoreContext,
                 expandNested,
-                size
+                size,
+                queryVectorSource,
+                sourceSupplier
             ).boost(boost).queryName(queryName);
         }
 
@@ -264,9 +300,13 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] requires fieldName", NAME));
             }
 
-            if (vector == null) {
+            final boolean hasVector = vector != null && vector.length > 0;
+            if (hasVector && queryVectorSource != null) {
+                throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] cannot set both vector and source", NAME));
+            }
+            if (vector == null && queryVectorSource == null && sourceSupplier == null) {
                 throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] requires query vector", NAME));
-            } else if (vector.length == 0) {
+            } else if (vector != null && vector.length == 0) {
                 throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] query vector is empty", NAME));
             }
 
@@ -382,6 +422,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         rescoreContext = builder.rescoreContext;
         expandNested = builder.expandNested;
         size = builder.size;
+        queryVectorSource = builder.queryVectorSource;
+        sourceSupplier = null;
     }
 
     @Override
@@ -424,6 +466,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             return KNNQueryBuilder.builder()
                 .fieldName(fieldName)
                 .vector(vector)
+                .queryVectorSource(queryVectorSource)
                 .k(k)
                 .maxDistance(maxDistance)
                 .minScore(minScore)
@@ -439,6 +482,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         return KNNQueryBuilder.builder()
             .fieldName(fieldName)
             .vector(vector)
+            .queryVectorSource(queryVectorSource)
             .k(k)
             .maxDistance(maxDistance)
             .minScore(minScore)
@@ -457,6 +501,12 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
 
         if (mappedFieldType == null && ignoreUnmapped) {
             return new MatchNoDocsQuery();
+        }
+
+        if (this.vector == null) {
+            throw new IllegalStateException(
+                String.format(Locale.ROOT, "[%s] query vector source must be rewritten on the coordinating node", NAME)
+            );
         }
 
         if (!(mappedFieldType instanceof KNNVectorFieldType)) {
@@ -755,7 +805,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             && Objects.equals(ignoreUnmapped, other.ignoreUnmapped)
             && Objects.equals(rescoreContext, other.rescoreContext)
             && Objects.equals(expandNested, other.expandNested)
-            && Objects.equals(size, other.size);
+            && Objects.equals(size, other.size)
+            && Objects.equals(queryVectorSource, other.queryVectorSource);
     }
 
     @Override
@@ -771,7 +822,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             minScore,
             rescoreContext,
             expandNested,
-            size
+            size,
+            queryVectorSource
         );
     }
 
@@ -782,27 +834,166 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
 
     @Override
     protected QueryBuilder doRewrite(QueryRewriteContext queryRewriteContext) throws IOException {
+        if (sourceSupplier != null) {
+            final ResolvedQueryVector resolved = sourceSupplier.get();
+            if (resolved == null) {
+                return this;
+            }
+            return copyBuilder().vector(resolved.vector)
+                .queryVectorSource(null)
+                .sourceSupplier(null)
+                .filter(combineResolvedFilter(filter, queryVectorSource, resolved))
+                .build();
+        }
+        if (queryVectorSource != null && vector == null) {
+            final SetOnce<ResolvedQueryVector> once = new SetOnce<>();
+            final QueryVectorSource source = queryVectorSource;
+            final String vectorField = source.getField() != null ? source.getField() : fieldName;
+            queryRewriteContext.registerAsyncAction(
+                (client, listener) -> fetchQueryVector(
+                    source,
+                    vectorField,
+                    queryRewriteContext,
+                    client,
+                    ActionListener.map(listener, resolved -> {
+                        once.set(resolved);
+                        return null;
+                    })
+                )
+            );
+            return copyBuilder().sourceSupplier(once::get).build();
+        }
+
         final QueryBuilder rewrittenFilter = Objects.nonNull(filter) ? filter.rewrite(queryRewriteContext) : filter;
         final Integer resolvedSize = resolveSize(queryRewriteContext);
 
         if (rewrittenFilter != filter || resolvedSize != null) {
-            return KNNQueryBuilder.builder()
-                .fieldName(this.fieldName)
-                .vector(this.vector)
-                .k(this.k)
-                .maxDistance(this.maxDistance)
-                .minScore(this.minScore)
-                .methodParameters(this.methodParameters)
-                .filter(rewrittenFilter)
-                .ignoreUnmapped(this.ignoreUnmapped)
-                .rescoreContext(this.rescoreContext)
-                .expandNested(this.expandNested)
-                .size(resolvedSize != null ? resolvedSize : this.size)
-                .boost(this.boost)
-                .queryName(this.queryName)
-                .build();
+            return copyBuilder().filter(rewrittenFilter).size(resolvedSize != null ? resolvedSize : this.size).build();
         }
         return super.doRewrite(queryRewriteContext);
+    }
+
+    private Builder copyBuilder() {
+        return KNNQueryBuilder.builder()
+            .fieldName(this.fieldName)
+            .vector(this.vector)
+            .queryVectorSource(this.queryVectorSource)
+            .sourceSupplier(this.sourceSupplier)
+            .k(this.k)
+            .maxDistance(this.maxDistance)
+            .minScore(this.minScore)
+            .methodParameters(this.methodParameters)
+            .filter(this.filter)
+            .ignoreUnmapped(this.ignoreUnmapped)
+            .rescoreContext(this.rescoreContext)
+            .expandNested(this.expandNested)
+            .size(this.size)
+            .boost(this.boost)
+            .queryName(this.queryName);
+    }
+
+    private static QueryBuilder combineResolvedFilter(
+        final QueryBuilder existingFilter,
+        final QueryVectorSource source,
+        final ResolvedQueryVector resolved
+    ) {
+        final BoolQueryBuilder bool = QueryBuilders.boolQuery();
+        if (existingFilter != null) {
+            bool.filter(existingFilter);
+        }
+        if (source != null && source.getRoutingField() != null) {
+            if (resolved.routingValue == null) {
+                throw new IllegalArgumentException(
+                    String.format(Locale.ROOT, "[%s] source document is missing routing_field [%s]", NAME, source.getRoutingField())
+                );
+            }
+            bool.filter(QueryBuilders.termQuery(source.getRoutingField(), resolved.routingValue));
+        }
+        if (source != null) {
+            bool.mustNot(QueryBuilders.idsQuery().addIds(source.getId()));
+        }
+        return bool;
+    }
+
+    private static void fetchQueryVector(
+        final QueryVectorSource source,
+        final String vectorField,
+        final QueryRewriteContext queryRewriteContext,
+        final Client client,
+        final ActionListener<ResolvedQueryVector> listener
+    ) {
+        final String index = resolveSourceIndex(source, queryRewriteContext);
+        final GetRequest getRequest = new GetRequest(index, source.getId());
+        final String[] includes = source.getRoutingField() == null
+            ? new String[] { vectorField }
+            : new String[] { vectorField, source.getRoutingField() };
+        getRequest.fetchSourceContext(new FetchSourceContext(true, includes, null));
+        client.get(getRequest, ActionListener.delegateFailure(listener, (delegatedListener, getResponse) -> {
+            delegatedListener.onResponse(resolveFromGetResponse(source, vectorField, index, getResponse));
+        }));
+    }
+
+    private static String resolveSourceIndex(final QueryVectorSource source, final QueryRewriteContext queryRewriteContext) {
+        if (Strings.isNullOrEmpty(source.getIndex()) == false) {
+            return source.getIndex();
+        }
+        final QueryCoordinatorContext coordinatorContext = queryRewriteContext.convertToCoordinatorContext();
+        if (coordinatorContext != null && coordinatorContext.getSearchRequest() instanceof SearchRequest searchRequest) {
+            final String[] indices = searchRequest.indices();
+            if (indices != null && indices.length == 1 && "*".equals(indices[0]) == false && indices[0].contains("*") == false) {
+                return indices[0];
+            }
+        }
+        throw new IllegalArgumentException(
+            String.format(Locale.ROOT, "[%s] source requires index when the search target is not a single concrete index", NAME)
+        );
+    }
+
+    private static ResolvedQueryVector resolveFromGetResponse(
+        final QueryVectorSource source,
+        final String vectorField,
+        final String index,
+        final GetResponse getResponse
+    ) {
+        if (getResponse.isExists() == false) {
+            throw new IllegalArgumentException(
+                String.format(Locale.ROOT, "[%s] source document [%s/%s] was not found", NAME, index, source.getId())
+            );
+        }
+        final Map<String, Object> documentSource = getResponse.getSourceAsMap();
+        if (documentSource == null) {
+            throw new IllegalArgumentException(
+                String.format(Locale.ROOT, "[%s] source document [%s/%s] has no _source", NAME, index, source.getId())
+            );
+        }
+        final List<Object> rawVector = XContentMapValues.extractRawValues(vectorField, documentSource);
+        if (rawVector == null || rawVector.isEmpty()) {
+            throw new IllegalArgumentException(
+                String.format(Locale.ROOT, "[%s] source document [%s/%s] is missing field [%s]", NAME, index, source.getId(), vectorField)
+            );
+        }
+        final float[] vector = toFloatArray(rawVector);
+        Object routingValue = null;
+        if (source.getRoutingField() != null) {
+            final List<Object> routingValues = XContentMapValues.extractRawValues(source.getRoutingField(), documentSource);
+            routingValue = routingValues == null || routingValues.isEmpty() ? null : routingValues.get(0);
+        }
+        return new ResolvedQueryVector(vector, routingValue);
+    }
+
+    private static float[] toFloatArray(final List<Object> values) {
+        final float[] vector = new float[values.size()];
+        for (int i = 0; i < values.size(); i++) {
+            final Object value = values.get(i);
+            if ((value instanceof Number) == false) {
+                throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] source field must be an array of numbers", NAME));
+            }
+            vector[i] = ((Number) value).floatValue();
+        }
+        if (vector.length == 0) {
+            throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] query vector is empty", NAME));
+        }
+        return vector;
     }
 
     /**
@@ -843,5 +1034,15 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         private final MethodComponentContext methodComponentContext;
         private final SpaceType spaceType;
         private final VectorDataType vectorDataType;
+    }
+
+    static final class ResolvedQueryVector {
+        private final float[] vector;
+        private final Object routingValue;
+
+        ResolvedQueryVector(float[] vector, Object routingValue) {
+            this.vector = vector;
+            this.routingValue = routingValue;
+        }
     }
 }
